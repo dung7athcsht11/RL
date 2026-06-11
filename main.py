@@ -5046,7 +5046,9 @@ try:
     model.load_state_dict(torch.load(get_weights_path(), map_location=device))
     model.eval()
     model_loaded = True
+    print("Diffusion loaded")
 except Exception as e:
+    print(f"Failed to load diffusion: {e}")
     pass
 
 def sample_action(state, num_steps=50):
@@ -5108,7 +5110,6 @@ def heuristic_agent_internal(obs, config=None,return_phase = True, forced_phase 
         phase = forced_phase
     else: 
       phase = world.mode
-      # Map phase về các phase cũ để tương thích pipeline
       phase_mapping = {'patient': 'grow', 'opportunistic': 'expand', 'pressure': 'aggressive'}
       phase = phase_mapping.get(phase, 'grow')
     if not world.my_planets:
@@ -5147,7 +5148,6 @@ cql = None
 
 if cql_path_str:
     try:
-        # Tải mô hình TorchScript (Không cần import d3rlpy)
         cql = torch.jit.load(cql_path_str, map_location=torch.device('cpu'))
         cql.eval()
         print("CQL TorchScript policy loaded")
@@ -5177,7 +5177,6 @@ def get_val_path():
         Path("validator_weights.npz")
     ]
     try:
-        # Lấy chính xác đường dẫn từ nơi chứa file main.py
         candidates.insert(0, Path(__file__).resolve().parent / "validator_weights.npz")
     except NameError:
         pass
@@ -5199,31 +5198,58 @@ if val_path_str:
         print(f"Failed to load Validator weights: {e}")
 else:
     print("validator_weights.npz not found, Validator disabled")
+
 def agent(obs, config=None):
-    # --- Phần chọn phase bằng Offline RL (CQL) hoặc fallback ---
-    if cql is not None:
+    # --- Kết hợp CQL và diffusion nếu cả hai đều có ---
+    cql_available = cql is not None
+    diff_available = model_loaded
+
+    if cql_available and diff_available:
+        # 1. Lấy action từ CQL
         state = extract_state(obs)
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            cql_action = int(cql(state_tensor).item())
         
+        # 2. Lấy action và confidence từ diffusion
+        macro_id, probs = sample_action(state)
+        diff_action = macro_id
+        diff_conf = probs[macro_id]
+        
+        # 3. Quyết định phase cuối
+        if diff_conf >= 0.6: 
+            final_action = diff_action
+        else:
+            final_action = cql_action
+        
+        forced_phase = MACRO_TO_PHASE.get(final_action, 'grow')
+        moves = heuristic_agent_internal(obs, config, return_phase=False, forced_phase=forced_phase)
+    
+    elif cql_available:
+        # Chỉ có CQL
+        state = extract_state(obs)
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             action = int(cql(state_tensor).item())
-            
         forced_phase = MACRO_TO_PHASE.get(action, 'grow')
         moves = heuristic_agent_internal(obs, config, return_phase=False, forced_phase=forced_phase)
-    else:
-        if model_loaded:
-            state = extract_state(obs)
-            macro_id, probs = sample_action(state)
-            confidence = probs[macro_id]
-            if confidence > THRESHOLD:
-                forced_phase = MACRO_TO_PHASE.get(macro_id, 'grow')
-                moves = heuristic_agent_internal(obs, config, return_phase=False, forced_phase=forced_phase)
-            else:
-                moves = heuristic_agent_internal(obs, config, return_phase=False)
+    
+    elif diff_available:
+        # Chỉ có diffusion
+        state = extract_state(obs)
+        macro_id, probs = sample_action(state)
+        confidence = probs[macro_id]
+        if confidence > THRESHOLD:
+            forced_phase = MACRO_TO_PHASE.get(macro_id, 'grow')
+            moves = heuristic_agent_internal(obs, config, return_phase=False, forced_phase=forced_phase)
         else:
             moves = heuristic_agent_internal(obs, config, return_phase=False)
+    
+    else:
+        # Không có mô hình nào
+        moves = heuristic_agent_internal(obs, config, return_phase=False)
 
-    # --- Phần shot validator ---
+    # shot validator 
     if _VALIDATOR is not None and moves:
         planets = obs.get('planets', [])
         player = obs.get('player', 0)
